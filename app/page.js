@@ -23,11 +23,22 @@ const MARKETS = [
   { symbol: "GOLD",      deployer: "xyz",  label: "Gold",           cat: "Commodities",sector: "Commodity" },
 ];
 
-const SEED = { OPENAI:28.5,SPACEX:185,ANTHROPIC:45,CRCL:6.2,CRWV:42,MAG7:380,SEMIS:210,DEFENSE:165,BIOTECH:88,NVDA:118,TSLA:245,AAPL:192,GOOGL:175,META:508,SP500:540,GOLD:2340 };
+const PAIR = m => `${m.deployer}:${m.symbol}`;
+const ALL_PAIRS = MARKETS.map(PAIR);
+
+const SEED = { OPENAI:1350,SPACEX:2176,ANTHROPIC:1707,CRCL:101,CRWV:121,MAG7:69,SEMIS:633,DEFENSE:65,BIOTECH:127,NVDA:221,TSLA:419,AAPL:314,GOOGL:363,META:560,SP500:537,GOLD:2355 };
 const CATS = ["All","Pre-IPO","Baskets","Equities","Indices","Commodities"];
 const INTERVALS = ["1s","1m","5m","1h","1D"];
 const LOOKBACKS = ["15m","1h","4h","1D","7D"];
 const SECT_COL = { AI:"#a78bfa",Aero:"#60a5fa",Crypto:"#f59e0b",Cloud:"#34d399",Tech:"#38bdf8",Defense:"#fb923c",Health:"#f472b6",Auto:"#4ade80",Index:"#a78bfa",Commodity:"#fbbf24" };
+
+const FIELD_SETS = [
+  "pair_address timestamp open high low close volume",
+  "pair_address timestamp open high low close volume_quote volume_base",
+  "pair_address dt open high low close volume_quote",
+  "pairAddress timestamp open high low close volume",
+  "pair_address t open high low close v",
+];
 
 function seedCandles(sym, n = 90) {
   let p = SEED[sym] || 50;
@@ -39,8 +50,23 @@ function seedCandles(sym, n = 90) {
   });
 }
 
-const fmt = (n, d = 2) => typeof n === "number" ? n.toFixed(d) : "--";
+const fmt = (n, d = 2) => typeof n === "number" && isFinite(n) ? n.toFixed(d) : "--";
 const fmtVol = n => n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : n?.toFixed(0) || "--";
+
+function parseTs(v) {
+  if (v == null) return Date.now();
+  if (typeof v === "number") return v > 1e12 ? v : v * 1000;
+  const n = Number(v);
+  if (isFinite(n)) return n > 1e12 ? n : n * 1000;
+  const p = Date.parse(v);
+  return isFinite(p) ? p : Date.now();
+}
+
+function symbolFromPair(pa) {
+  if (!pa) return null;
+  const part = pa.includes(":") ? pa.split(":")[1] : pa;
+  return part.replace("-USDC", "").replace("-USDH", "").toUpperCase();
+}
 
 function drawChart(canvas, data) {
   if (!canvas || !data || data.length < 2) return;
@@ -114,14 +140,16 @@ export default function Dashboard() {
     const m = {}; MARKETS.forEach(mk => { m[mk.symbol] = seedCandles(mk.symbol); }); return m;
   });
   const [live, setLive] = useState({});
-  const [status, setStatus] = useState("demo");
+  const [status, setStatus] = useState("connecting");
+  const [debug, setDebug] = useState("starting up");
   const canvasRef = useRef(null);
   const wsRef = useRef(null);
+  const liveRef = useRef(false);
+  const candidateRef = useRef(0);
 
-  // Simulate ticks in demo mode
   useEffect(() => {
     const iv = setInterval(() => {
-      if (status === "connected") return;
+      if (liveRef.current) return;
       setCmap(prev => {
         const nxt = { ...prev };
         MARKETS.forEach(mk => {
@@ -142,9 +170,8 @@ export default function Dashboard() {
       });
     }, 1000);
     return () => clearInterval(iv);
-  }, [status]);
+  }, []);
 
-  // Compute live stats
   useEffect(() => {
     const s = {};
     MARKETS.forEach(mk => {
@@ -164,52 +191,92 @@ export default function Dashboard() {
     setLive(s);
   }, [cmap]);
 
-  // Redraw on selection/data change
-  useEffect(() => {
-    drawChart(canvasRef.current, cmap[sel.symbol]);
-  }, [cmap, sel]);
+  useEffect(() => { drawChart(canvasRef.current, cmap[sel.symbol]); }, [cmap, sel]);
 
-  // GoldRush WebSocket
+  function applyCandle(raw) {
+    const sym = symbolFromPair(raw.pair_address || raw.pairAddress);
+    if (!sym || !MARKETS.find(m => m.symbol === sym)) return;
+    const o = +raw.open, h = +raw.high, l = +raw.low, c = +raw.close;
+    const v = +(raw.volume ?? raw.volume_quote ?? raw.v ?? 0);
+    const ts = parseTs(raw.timestamp ?? raw.dt ?? raw.t);
+    if (!isFinite(c) || c <= 0) return;
+    liveRef.current = true;
+    setStatus("connected");
+    setCmap(prev => {
+      const arr = prev[sym] ? [...prev[sym]] : [];
+      const lastIdx = arr.length - 1;
+      const candle = { o: o || c, h: h || c, l: l || c, c, v: v || 0, ts };
+      if (lastIdx >= 0 && Math.abs(arr[lastIdx].ts - ts) < 30000) {
+        arr[lastIdx] = candle;
+      } else {
+        arr.push(candle);
+      }
+      return { ...prev, [sym]: arr.slice(-120) };
+    });
+  }
+
+  const subscribe = useCallback((ws) => {
+    const fields = FIELD_SETS[candidateRef.current] || FIELD_SETS[0];
+    const pairs = JSON.stringify(ALL_PAIRS);
+    const q = `subscription{ohlcvCandlesForPair(chain_name:HYPERCORE_MAINNET pair_addresses:${pairs} interval:ONE_MINUTE timeframe:ONE_HOUR){${fields}}}`;
+    ws.send(JSON.stringify({ id: `sub-${candidateRef.current}`, type: "subscribe", payload: { query: q } }));
+    setDebug(`subscribed (field set #${candidateRef.current + 1})`);
+  }, []);
+
   const connect = useCallback(() => {
-    if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+    if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
+    liveRef.current = false;
+    candidateRef.current = 0;
     setStatus("connecting");
-    const timer = setTimeout(() => setStatus("demo"), 9000);
+    setDebug("opening websocket…");
+    const timer = setTimeout(() => { if (!liveRef.current) { setStatus("demo"); setDebug("no live data — using demo"); } }, 12000);
     try {
       const ws = new WebSocket(WS_URL, ["graphql-transport-ws"]);
       wsRef.current = ws;
-      ws.onopen = () => ws.send(JSON.stringify({ type: "connection_init", payload: { Authorization: `Bearer ${API_KEY}` } }));
+      ws.onopen = () => {
+        setDebug("sending connection_init");
+        ws.send(JSON.stringify({ type: "connection_init", payload: { GOLDRUSH_API_KEY: API_KEY } }));
+      };
       ws.onmessage = e => {
-        const msg = JSON.parse(e.data);
+        let msg; try { msg = JSON.parse(e.data); } catch { return; }
+        if (msg.type === "ping") { ws.send(JSON.stringify({ type: "pong" })); return; }
         if (msg.type === "connection_ack") {
-          clearTimeout(timer);
-          setStatus("connected");
-          MARKETS.forEach((mk, i) => ws.send(JSON.stringify({
-            id: `s${i}`, type: "subscribe",
-            payload: { query: `subscription{ohlcvCandlesForPair(chain_name:HYPERCORE_MAINNET pair_addresses:["${mk.deployer}:${mk.symbol}-USDC"] interval:ONE_MINUTE timeframe:ONE_HOUR){pair_address open high low close volume_quote dt}}` }
-          })));
+          setDebug("connected — subscribing");
+          subscribe(ws);
         }
         if (msg.type === "next") {
           const raw = msg.payload?.data?.ohlcvCandlesForPair;
           if (!raw) return;
-          (Array.isArray(raw) ? raw : [raw]).filter(Boolean).forEach(c => {
-            const pa = c.pair_address || "";
-            const sym = pa.split(":")[1]?.replace("-USDC", "");
-            if (!sym) return;
-            const nc = { o: +c.open, h: +c.high, l: +c.low, c: +c.close, v: +(c.volume_quote || 0), ts: new Date(c.dt).getTime() };
-            if (nc.c > 0) setCmap(prev => ({ ...prev, [sym]: [...(prev[sym] || []).slice(-99), nc] }));
-          });
+          clearTimeout(timer);
+          (Array.isArray(raw) ? raw : [raw]).filter(Boolean).forEach(applyCandle);
         }
-        if (msg.type === "error") setStatus("demo");
+        if (msg.type === "error") {
+          const m = JSON.stringify(msg.payload || msg);
+          setDebug(`field set #${candidateRef.current + 1} rejected: ${m.slice(0, 120)}`);
+          if (candidateRef.current < FIELD_SETS.length - 1) {
+            candidateRef.current += 1;
+            subscribe(ws);
+          } else {
+            setStatus("demo");
+            setDebug("all field sets rejected — using demo. Check console.");
+          }
+        }
       };
-      ws.onerror = () => { clearTimeout(timer); setStatus("demo"); };
-      ws.onclose = () => clearTimeout(timer);
-    } catch { setStatus("demo"); }
-  }, []);
+      ws.onerror = () => { setDebug("websocket error"); };
+      ws.onclose = (ev) => {
+        clearTimeout(timer);
+        if (!liveRef.current) { setStatus("demo"); setDebug(`closed (code ${ev.code}) — using demo`); }
+      };
+    } catch (err) {
+      setStatus("demo");
+      setDebug("connect threw: " + err.message);
+    }
+  }, [subscribe]);
 
   useEffect(() => {
     connect();
-    return () => { if (wsRef.current) wsRef.current.close(); };
-  }, []);
+    return () => { if (wsRef.current) try { wsRef.current.close(); } catch {} };
+  }, [connect]);
 
   const filtered = cat === "All" ? MARKETS : MARKETS.filter(m => m.cat === cat);
   const sl = live[sel.symbol] || {};
@@ -244,10 +311,9 @@ export default function Dashboard() {
         @keyframes ticker { 0% { transform: translateX(0); } 100% { transform: translateX(-50%); } }
       `}</style>
 
-      {/* Header */}
       <header style={{ background: "#161b22", borderBottom: "0.5px solid #30363d", padding: "8px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <span style={{ fontSize: 15, fontWeight: 700, color: "#e6edf3", letterSpacing: "-.01em" }}>
+          <span style={{ fontSize: 15, fontWeight: 700, color: "#e6edf3" }}>
             ◆ PRE-IPO<span style={{ fontWeight: 400, color: "#6e7681" }}> Dashboard</span>
             <span style={{ color: "#a78bfa", fontSize: 11, marginLeft: 6 }}>HIP-3</span>
           </span>
@@ -262,7 +328,6 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {/* Scrolling ticker */}
       <div style={{ background: "#0d1117", borderBottom: "0.5px solid #21262d", padding: "4px 0", overflow: "hidden", flexShrink: 0 }}>
         <div style={{ display: "flex", animation: "ticker 35s linear infinite", whiteSpace: "nowrap" }}>
           {[...MARKETS, ...MARKETS].map((mk, i) => {
@@ -278,9 +343,7 @@ export default function Dashboard() {
       </div>
 
       <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
-        {/* Left sidebar */}
         <div style={{ width: 290, borderRight: "0.5px solid #21262d", display: "flex", flexDirection: "column", overflow: "hidden", flexShrink: 0 }}>
-          {/* Heatmap */}
           <div style={{ padding: "10px 12px", borderBottom: "0.5px solid #21262d" }}>
             <div style={{ fontSize: 9, color: "#484f58", letterSpacing: ".1em", marginBottom: 8 }}>SECTOR HEATMAP</div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4 }}>
@@ -297,18 +360,15 @@ export default function Dashboard() {
             </div>
           </div>
 
-          {/* Category filter */}
           <div style={{ padding: "8px 12px", borderBottom: "0.5px solid #21262d", display: "flex", flexWrap: "wrap", gap: 4 }}>
             {CATS.map(c => <button key={c} className={`pill${cat === c ? " on" : ""}`} onClick={() => setCat(c)}>{c}</button>)}
           </div>
 
-          {/* Table header */}
           <div style={{ padding: "5px 12px", display: "flex", justifyContent: "space-between", fontSize: 9, color: "#484f58", borderBottom: "0.5px solid #21262d", letterSpacing: ".08em" }}>
             <span>SYMBOL</span>
             <span style={{ display: "flex", gap: 24 }}><span>PRICE</span><span>24H %</span></span>
           </div>
 
-          {/* Market list */}
           <div style={{ flex: 1, overflowY: "auto" }}>
             {filtered.map(mk => {
               const d = live[mk.symbol] || {}; const pu = (d.pct || 0) >= 0;
@@ -339,17 +399,14 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Right: chart panel */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-          {/* Chart header */}
           <div style={{ padding: "10px 16px", borderBottom: "0.5px solid #21262d", display: "flex", alignItems: "center", gap: 12, flexShrink: 0, flexWrap: "wrap" }}>
             <div style={{ width: 34, height: 34, borderRadius: 8, background: (SECT_COL[sel.sector] || "#6e7681") + "22", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, color: SECT_COL[sel.sector] || "#6e7681" }}>
               {sel.symbol[0]}
             </div>
             <div>
               <div style={{ fontSize: 14, fontWeight: 600, color: "#e6edf3" }}>
-                {sel.label}
-                <span style={{ fontSize: 10, color: "#6e7681", marginLeft: 6 }}>{sel.cat}</span>
+                {sel.label}<span style={{ fontSize: 10, color: "#6e7681", marginLeft: 6 }}>{sel.cat}</span>
               </div>
               <div style={{ fontSize: 9, color: "#484f58" }}>{sel.deployer}:{sel.symbol}</div>
             </div>
@@ -369,12 +426,10 @@ export default function Dashboard() {
             </div>
           </div>
 
-          {/* Candlestick chart */}
           <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
             <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
           </div>
 
-          {/* OHLCV stats */}
           <div style={{ padding: "10px 16px", borderTop: "0.5px solid #21262d", display: "flex", flexShrink: 0, flexWrap: "wrap", gap: 8 }}>
             {[["Open", `$${fmt(sl.open)}`], ["High", `$${fmt(sl.high)}`], ["Low", `$${fmt(sl.low)}`], ["Close", `$${fmt(sl.close)}`], ["Volume (USD)", fmtVol(sl.vol)]].map(([l, v], i, arr) => (
               <div key={l} style={{ flex: 1, padding: "0 12px", borderRight: i < arr.length - 1 ? "0.5px solid #21262d" : "none", minWidth: 80 }}>
@@ -382,6 +437,10 @@ export default function Dashboard() {
                 <div style={{ fontSize: 13, fontWeight: 500, color: l === "High" ? "#22c55e" : l === "Low" ? "#ef4444" : "#e6edf3" }}>{v}</div>
               </div>
             ))}
+          </div>
+
+          <div style={{ padding: "4px 16px", background: "#0a0d12", borderTop: "0.5px solid #21262d", fontSize: 9, color: "#484f58", flexShrink: 0, fontFamily: "monospace" }}>
+            status: {debug}
           </div>
         </div>
       </div>
