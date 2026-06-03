@@ -24,20 +24,19 @@ const MARKETS = [
 ];
 
 const PAIR = m => `${m.deployer}:${m.symbol}`;
-const ALL_PAIRS = MARKETS.map(PAIR);
 
-const SEED = { OPENAI:1350,SPACEX:2176,ANTHROPIC:1707,CRCL:101,CRWV:121,MAG7:69,SEMIS:633,DEFENSE:65,BIOTECH:127,NVDA:221,TSLA:419,AAPL:314,GOOGL:363,META:560,SP500:537,GOLD:2355 };
+const SEED = { OPENAI:1350,SPACEX:2199,ANTHROPIC:1746,CRCL:108,CRWV:118,MAG7:69,SEMIS:627,DEFENSE:66,BIOTECH:138,NVDA:218,TSLA:408,AAPL:304,GOOGL:353,META:561,SP500:7600,GOLD:2329 };
 const CATS = ["All","Pre-IPO","Baskets","Equities","Indices","Commodities"];
 const INTERVALS = ["1s","1m","5m","1h","1D"];
 const LOOKBACKS = ["15m","1h","4h","1D","7D"];
 const SECT_COL = { AI:"#a78bfa",Aero:"#60a5fa",Crypto:"#f59e0b",Cloud:"#34d399",Tech:"#38bdf8",Defense:"#fb923c",Health:"#f472b6",Auto:"#4ade80",Index:"#a78bfa",Commodity:"#fbbf24" };
 
 const FIELD_SETS = [
-  "pair_address timestamp open high low close volume",
-  "pair_address timestamp open high low close volume_quote volume_base",
-  "pair_address dt open high low close volume_quote",
-  "pairAddress timestamp open high low close volume",
-  "pair_address t open high low close v",
+  "t o h l c v",
+  "timestamp open high low close volume",
+  "t open high low close volume",
+  "timestamp open high low close volume_quote",
+  "dt open high low close volume_quote",
 ];
 
 function seedCandles(sym, n = 90) {
@@ -60,12 +59,6 @@ function parseTs(v) {
   if (isFinite(n)) return n > 1e12 ? n : n * 1000;
   const p = Date.parse(v);
   return isFinite(p) ? p : Date.now();
-}
-
-function symbolFromPair(pa) {
-  if (!pa) return null;
-  const part = pa.includes(":") ? pa.split(":")[1] : pa;
-  return part.replace("-USDC", "").replace("-USDH", "").toUpperCase();
 }
 
 function drawChart(canvas, data) {
@@ -146,6 +139,8 @@ export default function Dashboard() {
   const wsRef = useRef(null);
   const liveRef = useRef(false);
   const candidateRef = useRef(0);
+  const gotRef = useRef(0);
+  const cycleTimerRef = useRef(null);
 
   useEffect(() => {
     const iv = setInterval(() => {
@@ -193,85 +188,93 @@ export default function Dashboard() {
 
   useEffect(() => { drawChart(canvasRef.current, cmap[sel.symbol]); }, [cmap, sel]);
 
-  function applyCandle(raw) {
-    const sym = symbolFromPair(raw.pair_address || raw.pairAddress);
+  function applyCandle(sym, raw) {
     if (!sym || !MARKETS.find(m => m.symbol === sym)) return;
-    const o = +raw.open, h = +raw.high, l = +raw.low, c = +raw.close;
-    const v = +(raw.volume ?? raw.volume_quote ?? raw.v ?? 0);
-    const ts = parseTs(raw.timestamp ?? raw.dt ?? raw.t);
+    const c = +(raw.c ?? raw.close);
     if (!isFinite(c) || c <= 0) return;
-    liveRef.current = true;
-    setStatus("connected");
+    const o = +(raw.o ?? raw.open ?? c);
+    const h = +(raw.h ?? raw.high ?? c);
+    const l = +(raw.l ?? raw.low ?? c);
+    const v = +(raw.v ?? raw.volume ?? raw.volume_quote ?? 0);
+    const ts = parseTs(raw.t ?? raw.timestamp ?? raw.dt);
+    if (!liveRef.current) { liveRef.current = true; setStatus("connected"); }
+    gotRef.current += 1;
+    setDebug(`LIVE - ${gotRef.current} candles received (field set #${candidateRef.current + 1})`);
     setCmap(prev => {
       const arr = prev[sym] ? [...prev[sym]] : [];
-      const lastIdx = arr.length - 1;
-      const candle = { o: o || c, h: h || c, l: l || c, c, v: v || 0, ts };
-      if (lastIdx >= 0 && Math.abs(arr[lastIdx].ts - ts) < 30000) {
-        arr[lastIdx] = candle;
-      } else {
-        arr.push(candle);
-      }
+      const li = arr.length - 1;
+      const candle = { o, h, l, c, v, ts };
+      if (li >= 0 && Math.abs(arr[li].ts - ts) < 30000) arr[li] = candle;
+      else arr.push(candle);
       return { ...prev, [sym]: arr.slice(-120) };
     });
   }
 
-  const subscribe = useCallback((ws) => {
+  const subscribeAll = useCallback((ws) => {
     const fields = FIELD_SETS[candidateRef.current] || FIELD_SETS[0];
-    const pairs = JSON.stringify(ALL_PAIRS);
-    const q = `subscription{ohlcvCandlesForPair(chain_name:HYPERCORE_MAINNET pair_addresses:${pairs} interval:ONE_MINUTE timeframe:ONE_HOUR){${fields}}}`;
-    ws.send(JSON.stringify({ id: `sub-${candidateRef.current}`, type: "subscribe", payload: { query: q } }));
-    setDebug(`subscribed (field set #${candidateRef.current + 1})`);
+    MARKETS.forEach(mk => {
+      const q = `subscription{ohlcvCandlesForPair(chain_name:HYPERCORE_MAINNET pair_addresses:["${PAIR(mk)}"] interval:ONE_MINUTE timeframe:ONE_HOUR){${fields}}}`;
+      ws.send(JSON.stringify({ id: `ohlcv-${mk.symbol}`, type: "subscribe", payload: { query: q } }));
+    });
+    setDebug(`trying field set #${candidateRef.current + 1}: { ${fields} }`);
+    if (cycleTimerRef.current) clearTimeout(cycleTimerRef.current);
+    cycleTimerRef.current = setTimeout(() => {
+      if (gotRef.current === 0 && candidateRef.current < FIELD_SETS.length - 1 && ws.readyState === 1) {
+        MARKETS.forEach(mk => ws.send(JSON.stringify({ id: `ohlcv-${mk.symbol}`, type: "complete" })));
+        candidateRef.current += 1;
+        subscribeAll(ws);
+      } else if (gotRef.current === 0 && candidateRef.current >= FIELD_SETS.length - 1) {
+        setStatus("demo");
+        setDebug("no live candles from any field set - using demo");
+      }
+    }, 3500);
   }, []);
 
   const connect = useCallback(() => {
     if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
     liveRef.current = false;
     candidateRef.current = 0;
+    gotRef.current = 0;
     setStatus("connecting");
-    setDebug("opening websocket…");
-    const timer = setTimeout(() => { if (!liveRef.current) { setStatus("demo"); setDebug("no live data — using demo"); } }, 12000);
+    setDebug("opening websocket...");
+    const failTimer = setTimeout(() => { if (!liveRef.current) { setStatus("demo"); } }, 20000);
     try {
       const ws = new WebSocket(WS_URL, ["graphql-transport-ws"]);
       wsRef.current = ws;
       ws.onopen = () => {
-        setDebug("sending connection_init");
+        setDebug("connected - authenticating");
         ws.send(JSON.stringify({ type: "connection_init", payload: { GOLDRUSH_API_KEY: API_KEY } }));
       };
       ws.onmessage = e => {
         let msg; try { msg = JSON.parse(e.data); } catch { return; }
         if (msg.type === "ping") { ws.send(JSON.stringify({ type: "pong" })); return; }
-        if (msg.type === "connection_ack") {
-          setDebug("connected — subscribing");
-          subscribe(ws);
-        }
+        if (msg.type === "connection_ack") { setDebug("authenticated - subscribing"); subscribeAll(ws); }
         if (msg.type === "next") {
+          const sym = (msg.id || "").replace("ohlcv-", "");
           const raw = msg.payload?.data?.ohlcvCandlesForPair;
           if (!raw) return;
-          clearTimeout(timer);
-          (Array.isArray(raw) ? raw : [raw]).filter(Boolean).forEach(applyCandle);
+          clearTimeout(failTimer);
+          (Array.isArray(raw) ? raw : [raw]).filter(Boolean).forEach(c => applyCandle(sym, c));
         }
         if (msg.type === "error") {
           const m = JSON.stringify(msg.payload || msg);
-          setDebug(`field set #${candidateRef.current + 1} rejected: ${m.slice(0, 120)}`);
-          if (candidateRef.current < FIELD_SETS.length - 1) {
+          setDebug(`field set #${candidateRef.current + 1} rejected: ${m.slice(0, 100)}`);
+          if (gotRef.current === 0 && candidateRef.current < FIELD_SETS.length - 1) {
             candidateRef.current += 1;
-            subscribe(ws);
-          } else {
-            setStatus("demo");
-            setDebug("all field sets rejected — using demo. Check console.");
+            subscribeAll(ws);
           }
         }
       };
-      ws.onerror = () => { setDebug("websocket error"); };
+      ws.onerror = () => setDebug("websocket error");
       ws.onclose = (ev) => {
-        clearTimeout(timer);
-        if (!liveRef.current) { setStatus("demo"); setDebug(`closed (code ${ev.code}) — using demo`); }
+        clearTimeout(failTimer);
+        if (!liveRef.current) { setStatus("demo"); setDebug(`socket closed (code ${ev.code}) - using demo`); }
       };
     } catch (err) {
       setStatus("demo");
       setDebug("connect threw: " + err.message);
     }
-  }, [subscribe]);
+  }, [subscribeAll]);
 
   useEffect(() => {
     connect();
@@ -314,11 +317,11 @@ export default function Dashboard() {
       <header style={{ background: "#161b22", borderBottom: "0.5px solid #30363d", padding: "8px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <span style={{ fontSize: 15, fontWeight: 700, color: "#e6edf3" }}>
-            ◆ PRE-IPO<span style={{ fontWeight: 400, color: "#6e7681" }}> Dashboard</span>
+            &#9670; PRE-IPO<span style={{ fontWeight: 400, color: "#6e7681" }}> Dashboard</span>
             <span style={{ color: "#a78bfa", fontSize: 11, marginLeft: 6 }}>HIP-3</span>
           </span>
           <span style={{ fontSize: 10, color: "#484f58", borderLeft: "0.5px solid #30363d", paddingLeft: 12 }}>
-            HyperCore Mainnet · {MARKETS.length} markets
+            HyperCore Mainnet &middot; {MARKETS.length} markets
           </span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10 }}>
@@ -335,7 +338,7 @@ export default function Dashboard() {
             return (
               <span key={i} style={{ fontSize: 11, padding: "0 14px", color: pu ? "#22c55e" : "#ef4444", borderRight: "0.5px solid #21262d33" }}>
                 {mk.symbol} <span style={{ color: "#e6edf3" }}>${fmt(d.price, 2)}</span>
-                {" "}<span>{pu ? "▲" : "▼"}{Math.abs(d.pct || 0).toFixed(2)}%</span>
+                {" "}<span>{pu ? "\u25B2" : "\u25BC"}{Math.abs(d.pct || 0).toFixed(2)}%</span>
               </span>
             );
           })}
@@ -395,7 +398,7 @@ export default function Dashboard() {
           </div>
 
           <div style={{ padding: "5px 12px", fontSize: 9, color: "#484f58", borderTop: "0.5px solid #21262d" }}>
-            Powered by GoldRush · Real-time WebSocket
+            Powered by GoldRush &middot; Real-time WebSocket
           </div>
         </div>
 
